@@ -105,11 +105,17 @@ def write_sheet(sheet_key, worksheet_name, df):
         try:
             time.sleep(2)  # Rate limit protection
             sheet = gc.open_by_key(sheet_key)
+            print(f"📄 Writing to spreadsheet: '{sheet.title}' → tab: '{worksheet_name}'")
             ws = sheet.worksheet(worksheet_name)
             ws.clear()
             set_with_dataframe(ws, df, include_index=False, include_column_header=True)
             print(f"✅ Successfully updated: {worksheet_name}")
             return
+        except gspread.exceptions.WorksheetNotFound:
+            available = [w.title for w in gc.open_by_key(sheet_key).worksheets()]
+            print(f"❌ Worksheet '{worksheet_name}' not found. "
+                  f"Available tabs: {available}")
+            raise
         except gspread.exceptions.APIError as e:
             if "RESOURCE_EXHAUSTED" in str(e) or "Quota exceeded" in str(e):
                 wait_time = 60 * attempt
@@ -153,10 +159,14 @@ def run_assignment_questions_bucket():
         r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/7939/query/json')
         data = validate_response(r, '7939')
         if not data:
+            print("⚠️ Card 7939 returned NO data — skipping write. "
+                  "Check the card directly in Metabase (it may depend on a "
+                  "parameter/filter not supplied by the /query/json call).")
             return
 
         df = pd.DataFrame(data)
-        print(f"📊 Fetched {len(df)} records")
+        print(f"📊 Fetched {len(df)} records | shape={df.shape} | "
+              f"cols={list(df.columns)[:8]}")
 
         df = df.fillna(0)
         df = df.rename(columns={'batch_name': 'Batch', 'module_name': 'Module'})
