@@ -94,23 +94,39 @@ def card_url(card_id):
     return f"{METABASE_BASE}/api/card/{card_id}/query/json"
 
 
-def mb_post(card_url, retry_count=0):
+# How long to wait for a Metabase card to run (seconds), and how many
+# times to retry a slow card. Some cards (e.g. 7939, 9913) are heavy and
+# can take several minutes — a short timeout kills them before data returns.
+MB_TIMEOUT = 360
+MB_MAX_TIMEOUT_RETRIES = 2
+
+
+def mb_post(card_url, retry_count=0, timeout_retries=0):
     """
     Make POST request to Metabase with automatic token refresh on auth failure
+    and retries for slow queries that time out.
     """
     try:
-        r = requests.post(card_url, headers=METABASE_HEADERS, timeout=120)
+        r = requests.post(card_url, headers=METABASE_HEADERS, timeout=MB_TIMEOUT)
 
         # If unauthorized and haven't retried yet, refresh token and retry
         if r.status_code == 401 and retry_count == 0:
             print("⚠️ Metabase token expired, refreshing...")
             refresh_metabase_token()
-            return mb_post(card_url, retry_count=1)
+            return mb_post(card_url, retry_count=1, timeout_retries=timeout_retries)
 
         r.raise_for_status()
         return r
     except requests.exceptions.Timeout:
-        print(f"⏱️ Timeout for {card_url}")
+        if timeout_retries < MB_MAX_TIMEOUT_RETRIES:
+            attempt = timeout_retries + 1
+            print(f"⏱️ Timeout for {card_url} — retry {attempt}/{MB_MAX_TIMEOUT_RETRIES} "
+                  f"(a slow first run often warms the cache)")
+            time.sleep(10)
+            return mb_post(card_url, retry_count=retry_count,
+                           timeout_retries=attempt)
+        print(f"⏱️ Timeout for {card_url} — giving up after "
+              f"{MB_MAX_TIMEOUT_RETRIES} retries")
         raise
     except requests.exceptions.RequestException as e:
         print(f"❌ Request failed for {card_url}: {e}")
