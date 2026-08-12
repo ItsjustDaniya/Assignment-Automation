@@ -67,6 +67,19 @@ def refresh_metabase_token():
 # Initial authentication
 refresh_metabase_token()
 
+# -------------------- ENVIRONMENT DIAGNOSTICS --------------------
+# Prints which identities the SCHEDULED run is actually using.
+# Compare this output against Colab to catch wrong-account / missing-secret issues.
+try:
+    print("🔎 ENV CHECK")
+    print(f"   MB user (USERNAME): {User_name!r}")
+    print(f"   MB secret present : {bool(sec)}")
+    print(f"   MB URL            : {MB_URL!r}")
+    print(f"   SA client_email   : {service_info.get('client_email')}")
+    print(f"   Token acquired    : {bool(token)}")
+except Exception as e:
+    print(f"⚠️ Env check failed: {e}")
+
 # -------------------- SHEET KEYS --------------------
 SHEET_PROJECTS_MAIN      = '1e9BxI2N6ms1hh_OdfHgktntxi41_2Y2Jv5Oo-WnQDAo'
 SHEET_AI_MOCK_RAW        = '1-nHZ8plywsj2qCjjW5cTVbYhZW81gN5HVfERk4YmvCM'
