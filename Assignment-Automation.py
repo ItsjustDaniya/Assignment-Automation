@@ -39,6 +39,8 @@ gc = gspread.authorize(creds)
 token = None
 METABASE_HEADERS = {}
 
+METABASE_BASE = "https://metabase-lierhfgoeiwhr.newtonschool.co"
+
 
 def refresh_metabase_token():
     """Refresh Metabase session token"""
@@ -66,12 +68,19 @@ def refresh_metabase_token():
 refresh_metabase_token()
 
 # -------------------- SHEET KEYS --------------------
-
-SHEET_PROJECTS_MAIN = '1e9BxI2N6ms1hh_OdfHgktntxi41_2Y2Jv5Oo-WnQDAo'
-
+SHEET_PROJECTS_MAIN      = '1e9BxI2N6ms1hh_OdfHgktntxi41_2Y2Jv5Oo-WnQDAo'
+SHEET_AI_MOCK_RAW        = '1-nHZ8plywsj2qCjjW5cTVbYhZW81gN5HVfERk4YmvCM'
+SHEET_AI                 = '1sUCcOrOgvZJc66Oyqjqo_ranftT1QApXoexKGdx3NG8'
+SHEET_LECTURE_QUALITY    = '1D-nPNTKoma5mS6B5_gAH5vRWysoGbE6inPghK969n8A'
+SHEET_LECTURE_FEEDBACK   = '1QKoJUTCM_rz7y0DVh_xEwqV1aGGd9dPHcZaLxBUtpiU'
 
 
 # -------------------- UTILITIES --------------------
+def card_url(card_id):
+    """Build the /query/json URL for a Metabase card"""
+    return f"{METABASE_BASE}/api/card/{card_id}/query/json"
+
+
 def mb_post(card_url, retry_count=0):
     """
     Make POST request to Metabase with automatic token refresh on auth failure
@@ -150,13 +159,103 @@ def validate_response(response, card_id):
         return None
 
 
+# -------------------- SECTION 1: AI MOCK LECTURES --------------------
+def run_ai_mock_lectures():
+    print("\n📌 Running: AI Mock Lectures")
+
+    try:
+        r = mb_post(card_url(9913))
+        data = validate_response(r, '9913')
+        if not data:
+            print("⚠️ Card 9913 returned NO data — skipping write.")
+            return
+
+        df_ai_mock = pd.DataFrame(data)
+        print(f"📊 Fetched {len(df_ai_mock)} records | shape={df_ai_mock.shape} | "
+              f"cols={list(df_ai_mock.columns)[:8]}")
+
+        # df_ai_mock['date'] = df_ai_mock['date'] + pd.Timedelta(hours=5.5)  # (kept from original, disabled)
+
+        # Same DataFrame goes to two different sheets/tabs
+        write_sheet(SHEET_AI_MOCK_RAW, "Raw", df_ai_mock)
+        write_sheet(SHEET_AI, "AI", df_ai_mock)
+
+    except Exception as e:
+        print(f"❌ Error in run_ai_mock_lectures: {e}")
+        traceback.print_exc()
+        raise
+
+
+# -------------------- SECTION 2: LECTURE QUALITY --------------------
+def run_lecture_quality():
+    print("\n📌 Running: Lecture Quality")
+
+    try:
+        r1 = mb_post(card_url(8646))
+        d1 = validate_response(r1, '8646')
+
+        r2 = mb_post(card_url(9192))
+        d2 = validate_response(r2, '9192')
+
+        r3 = mb_post(card_url(9166))
+        d3 = validate_response(r3, '9166')
+
+        if not d1 or not d2:
+            print("⚠️ Missing base data (card 8646 / 9192) — skipping write.")
+            return
+
+        df1 = pd.DataFrame(d1)
+        df2 = pd.DataFrame(d2)
+
+        df3 = pd.merge(df1, df2, on=['lecture_id', 'lecture_date'], how='inner')
+        df4 = df3.rename(columns={'course_name': 'Batch', 'lecture_date': 'date'})
+
+        if d3:
+            df_in_class = pd.DataFrame(d3).rename(
+                columns={'batch_name': 'Batch', 'release_date': 'date'}
+            )
+            df5 = pd.merge(df4, df_in_class, on=['Batch', 'date'], how='left')
+        else:
+            print("⚠️ Card 9166 returned no data — writing lecture quality "
+                  "without the in-class merge.")
+            df5 = df4
+
+        print(f"📊 Final Lecture_Quality shape={df5.shape}")
+        write_sheet(SHEET_LECTURE_QUALITY, "Lecture_Quality", df5)
+
+    except Exception as e:
+        print(f"❌ Error in run_lecture_quality: {e}")
+        traceback.print_exc()
+        raise
+
+
+# -------------------- SECTION 3: LECTURE SUBJECTIVE FEEDBACK --------------------
+def run_lecture_subjective_feedback():
+    print("\n📌 Running: Lecture Subjective Feedback")
+
+    try:
+        r = mb_post(card_url(5037))
+        data = validate_response(r, '5037')
+        if not data:
+            print("⚠️ Card 5037 returned NO data — skipping write.")
+            return
+
+        df = pd.DataFrame(data)
+        print(f"📊 Fetched {len(df)} records | shape={df.shape}")
+        write_sheet(SHEET_LECTURE_FEEDBACK, "Lecture_Subjective_Feedback", df)
+
+    except Exception as e:
+        print(f"❌ Error in run_lecture_subjective_feedback: {e}")
+        traceback.print_exc()
+        raise
+
 
 # -------------------- SECTION 4: ASSIGNMENT QUESTIONS BUCKET --------------------
 def run_assignment_questions_bucket():
     print("\n📌 Running: Assignment Questions Bucket")
 
     try:
-        r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/7939/query/json')
+        r = mb_post(card_url(7939))
         data = validate_response(r, '7939')
         if not data:
             print("⚠️ Card 7939 returned NO data — skipping write. "
@@ -178,17 +277,16 @@ def run_assignment_questions_bucket():
         raise
 
 
-
-
 # -------------------- MAIN: RUN ALL --------------------
 if __name__ == "__main__":
     print("🚀 Starting Data Pipeline Automation...")
     print(f"📅 Start time: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%d-%b-%Y %H:%M:%S IST')}\n")
 
     tasks = [
-
-        ("Assignment Questions Bucket", run_assignment_questions_bucket)
-
+        ("AI Mock Lectures",             run_ai_mock_lectures),
+        ("Lecture Quality",              run_lecture_quality),
+        ("Lecture Subjective Feedback",  run_lecture_subjective_feedback),
+        ("Assignment Questions Bucket",  run_assignment_questions_bucket),
     ]
 
     success_count = 0
