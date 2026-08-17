@@ -16,12 +16,10 @@ import traceback
 start_time = time.time()
 
 # -------------------- ENV & AUTH --------------------
-sec = os.getenv("ASHRITHA_SECRET_KEY")
-User_name = os.getenv("USERNAME")
+METABASE_API_KEY = os.getenv("METABASE_API_KEY")
 service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
-MB_URL = os.getenv("METABASE_URL")
 
-if not sec or not service_account_json:
+if not METABASE_API_KEY or not service_account_json:
     raise ValueError("❌ Missing environment variables. Check GitHub secrets.")
 
 # -------------------- GOOGLE AUTH --------------------
@@ -36,36 +34,10 @@ creds = Credentials.from_service_account_info(
 gc = gspread.authorize(creds)
 
 # -------------------- METABASE AUTH --------------------
-token = None
-METABASE_HEADERS = {}
-
-METABASE_BASE = "https://metabase-lierhfgoeiwhr.newtonschool.co"
-
-
-def refresh_metabase_token():
-    """Refresh Metabase session token"""
-    global token, METABASE_HEADERS
-    try:
-        res = requests.post(
-            MB_URL,
-            headers={"Content-Type": "application/json"},
-            json={"username": User_name, "password": sec},
-            timeout=30
-        )
-        res.raise_for_status()
-        token = res.json()['id']
-        METABASE_HEADERS = {
-            'Content-Type': 'application/json',
-            'X-Metabase-Session': token
-        }
-        print("✅ Metabase session token refreshed")
-    except Exception as e:
-        print(f"❌ Failed to refresh Metabase token: {e}")
-        raise
-
-
-# Initial authentication
-refresh_metabase_token()
+METABASE_HEADERS = {
+    'Content-Type': 'application/json',
+    'x-api-key': METABASE_API_KEY
+}
 
 # -------------------- ENVIRONMENT DIAGNOSTICS --------------------
 # Prints which identities the SCHEDULED run is actually using.
