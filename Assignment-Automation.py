@@ -9,7 +9,9 @@ FIXES IN THIS VERSION
   2. requests.Session with a urllib3 Retry adapter, POST explicitly allowed.
   3. Timeout is a (connect, read) tuple set BELOW the typical proxy read ceiling,
      so we get a clean client timeout instead of a server-side reset.
-  4. Token is refreshed between retries (a dropped connection can kill the session).
+  4. Auth uses a Metabase API key (x-api-key header) — no session token to
+     refresh, so a 401 just fails fast with a clear error instead of retrying
+     a login that can't fix an invalid/revoked key.
   5. Every request is timed, so slow cards are visible in the log.
   6. Automatic CSV fallback for heavy cards — starts streaming sooner than JSON.
   7. validate_response now RAISES on empty results and on Metabase's 202 error
@@ -17,8 +19,7 @@ FIXES IN THIS VERSION
   8. AI Mock's two sheet writes are isolated — one failure no longer skips the other.
   9. Freshness assertion warns when the newest row looks stale (cached result).
  10. sys.exit(1) on any task failure, so CI actually goes red.
- 11. METABASE_USERNAME env var (USERNAME is reserved on Windows runners).
- 12. NEW — dedupe_columns(): fetch_card_df() now normalizes duplicate/blank
+ 11. NEW — dedupe_columns(): fetch_card_df() now normalizes duplicate/blank
      column names the SAME way regardless of whether a card came back via the
      CSV or JSON endpoint. This is what was causing the "redundant columns"
      symptom on card 9913 in the script but not in the notebook: 9913 is a
@@ -51,14 +52,15 @@ from google.oauth2.service_account import Credentials
 start_time = time.time()
 
 # -------------------- ENV & AUTH --------------------
-
-MB_URL = os.getenv("METABASE_URL")
-
 METABASE_API_KEY = os.getenv("METABASE_API_KEY")
 service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
 
-if not METABASE_API_KEY or not service_account_json:
-    raise ValueError("❌ Missing environment variables. Check GitHub secrets.")
+missing = [n for n, v in [
+    ("METABASE_API_KEY", METABASE_API_KEY),
+    ("SERVICE_ACCOUNT_JSON", service_account_json),
+] if not v]
+if missing:
+    raise ValueError(f"❌ Missing environment variables: {', '.join(missing)}")
 
 # -------------------- GOOGLE AUTH --------------------
 service_info = json.loads(service_account_json)
@@ -73,6 +75,11 @@ gc = gspread.authorize(creds)
 
 # -------------------- METABASE CONFIG --------------------
 METABASE_BASE = "https://metabase-lierhfgoeiwhr.newtonschool.co"
+
+METABASE_HEADERS = {
+    "Content-Type": "application/json",
+    "x-api-key": METABASE_API_KEY,
+}
 
 # (connect_timeout, read_timeout).
 # Keep read_timeout UNDER the reverse-proxy ceiling in front of Metabase
@@ -91,12 +98,6 @@ MB_RETRY_BASE_WAIT = 20     # seconds; grows linearly per attempt
 # which is exactly the behavior already confirmed working in the notebook.
 # So for 9913 specifically, JSON is not just a fallback, it's the correct path.
 HEAVY_CARDS = {7939}
-
-token = None
-METABASE_HEADERS = {
-    'Content-Type': 'application/json',
-    'x-api-key': METABASE_API_KEY
-}
 
 # -------------------- HTTP SESSION WITH RETRIES --------------------
 SESSION = requests.Session()
@@ -117,39 +118,12 @@ _adapter = HTTPAdapter(
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
-
-def refresh_metabase_token():
-    """Refresh the Metabase session token."""
-    global token, METABASE_HEADERS
-    try:
-        res = SESSION.post(
-            MB_URL,
-            headers={"Content-Type": "application/json"},
-            json={"username": User_name, "password": sec},
-            timeout=(15, 60),
-        )
-        res.raise_for_status()
-        token = res.json()["id"]
-        METABASE_HEADERS = {
-            "Content-Type": "application/json",
-            "X-Metabase-Session": token,
-        }
-        print("✅ Metabase session token refreshed")
-    except Exception as e:
-        print(f"❌ Failed to refresh Metabase token: {e}")
-        raise
-
-
-refresh_metabase_token()
-
 # -------------------- ENVIRONMENT DIAGNOSTICS --------------------
 try:
     print("🔎 ENV CHECK")
-    print(f"   MB user           : {'[SET]' if User_name else '[MISSING]'}")
-    print(f"   MB secret present : {bool(sec)}")
+    print(f"   MB API key present: {bool(METABASE_API_KEY)}")
     print(f"   MB base           : {METABASE_BASE}")
     print(f"   SA client_email   : {service_info.get('client_email')}")
-    print(f"   Token acquired    : {bool(token)}")
     print(f"   Read timeout      : {MB_TIMEOUT[1]}s, retries: {MB_MAX_RETRIES}")
 except Exception as e:
     print(f"⚠️ Env check failed: {e}")
@@ -175,12 +149,16 @@ RETRYABLE = (
 )
 
 
-def mb_post(url, auth_retry=0, attempt=0, stream=False):
+def mb_post(url, attempt=0, stream=False):
     """
     POST to Metabase with:
-      - token refresh on 401
       - retries on timeout AND connection reset
       - elapsed-time logging so slow cards are visible
+
+    Auth is a static API key (x-api-key), so unlike session-token auth there
+    is nothing to refresh: a 401 means the key itself is missing/invalid/
+    revoked, and retrying with the same key would just fail the same way —
+    so we raise immediately with a clear message instead of looping.
     """
     label = url.split("/api/card/")[-1] if "/api/card/" in url else url
     t0 = time.time()
@@ -188,10 +166,11 @@ def mb_post(url, auth_retry=0, attempt=0, stream=False):
         r = SESSION.post(url, headers=METABASE_HEADERS,
                          timeout=MB_TIMEOUT, stream=stream)
 
-        if r.status_code == 401 and auth_retry == 0:
-            print("⚠️ Metabase token expired, refreshing...")
-            refresh_metabase_token()
-            return mb_post(url, auth_retry=1, attempt=attempt, stream=stream)
+        if r.status_code == 401:
+            raise RuntimeError(
+                f"Card {label}: Metabase rejected the API key (401). "
+                f"Check that METABASE_API_KEY is set and still valid."
+            )
 
         r.raise_for_status()
         print(f"   ⏱️ card {label} responded in {time.time() - t0:.0f}s")
@@ -204,11 +183,7 @@ def mb_post(url, auth_retry=0, attempt=0, stream=False):
             print(f"   🔁 {type(e).__name__} on card {label} after {elapsed:.0f}s "
                   f"— retry {attempt + 1}/{MB_MAX_RETRIES} in {wait}s")
             time.sleep(wait)
-            try:
-                refresh_metabase_token()
-            except Exception:
-                print("   ⚠️ Token refresh during retry failed; continuing anyway")
-            return mb_post(url, auth_retry=0, attempt=attempt + 1, stream=stream)
+            return mb_post(url, attempt=attempt + 1, stream=stream)
 
         print(f"   ❌ Card {label} gave up after {attempt + 1} attempts "
               f"({elapsed:.0f}s on the last one): {e}")
