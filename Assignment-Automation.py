@@ -19,7 +19,7 @@ FIXES IN THIS VERSION
   8. AI Mock's two sheet writes are isolated — one failure no longer skips the other.
   9. Freshness assertion warns when the newest row looks stale (cached result).
  10. sys.exit(1) on any task failure, so CI actually goes red.
- 11. NEW — dedupe_columns(): fetch_card_df() now normalizes duplicate/blank
+ 11. dedupe_columns(): fetch_card_df() now normalizes duplicate/blank
      column names the SAME way regardless of whether a card came back via the
      CSV or JSON endpoint. This is what was causing the "redundant columns"
      symptom on card 9913 in the script but not in the notebook: 9913 is a
@@ -29,6 +29,15 @@ FIXES IN THIS VERSION
      duplicate keys, so it "looked fine" — it just quietly dropped a column).
      Both paths now go through the same explicit dedupe step, and we log it
      loudly instead of failing silently.
+ 12. NEW — run_sheet_sync(): mirrors a tab from one Google Sheet into a
+     same-named tab of another Google Sheet (straight copy of values, no
+     Metabase involved — see SECTION 5 below). Folded in from the standalone
+     Colab sync notebook; the Colab-only bits (pip install, Colab Secrets
+     lookup) are dropped since this script already has SERVICE_ACCOUNT_JSON
+     and an authorized `gc` client. The write goes through the existing
+     write_sheet() so it gets the same clear/backoff/retry behavior as every
+     other sheet write in this pipeline, instead of the notebook's separate,
+     simpler write path.
 """
 
 import io
@@ -45,7 +54,7 @@ import pandas as pd
 import gspread
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from gspread_dataframe import set_with_dataframe
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 
 # -------------------- START TIMER --------------------
@@ -134,6 +143,18 @@ SHEET_AI_MOCK_RAW      = "1-nHZ8plywsj2qCjjW5cTVbYhZW81gN5HVfERk4YmvCM"
 SHEET_AI               = "1sUCcOrOgvZJc66Oyqjqo_ranftT1QApXoexKGdx3NG8"
 SHEET_LECTURE_QUALITY  = "1D-nPNTKoma5mS6B5_gAH5vRWysoGbE6inPghK969n8A"
 SHEET_LECTURE_FEEDBACK = "1QKoJUTCM_rz7y0DVh_xEwqV1aGGd9dPHcZaLxBUtpiU"
+
+# -------------------- SHEET-TO-SHEET SYNC CONFIG --------------------
+# Mirrors one tab from a source Google Sheet into the same-named tab of a
+# destination Google Sheet. Straight copy of values as displayed (not raw
+# formulas) — no filtering/transformation, no Metabase involved.
+#   Source: https://docs.google.com/spreadsheets/d/1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ  (tab: Student-Assign-WOW)
+#   Dest:   https://docs.google.com/spreadsheets/d/1knzRvmPqhvSudEJeXksQeXSZklAybIBfd_IMH7XLMK4  (tab: Student-Assign-WOW)
+# Both sheets must be shared with the service account's email as Editor.
+SYNC_SOURCE_SHEET_ID = "1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ"
+SYNC_SOURCE_TAB_NAME  = "Student-Assign-WOW"
+SYNC_DEST_SHEET_ID    = "1knzRvmPqhvSudEJeXksQeXSZklAybIBfd_IMH7XLMK4"
+SYNC_DEST_TAB_NAME    = "Student-Assign-WOW"
 
 
 # -------------------- METABASE FETCH --------------------
@@ -454,6 +475,56 @@ def run_assignment_questions_bucket():
     write_sheet(SHEET_PROJECTS_MAIN, "Assignments_questions_bucket", df)
 
 
+# -------------------- SECTION 5: SHEET-TO-SHEET SYNC --------------------
+def read_sheet_as_df(sheet_key, tab_name):
+    """
+    Read a worksheet tab into a DataFrame — values as displayed (formulas
+    evaluated), not raw formula strings — trimmed of fully-empty trailing
+    rows/columns (get_as_dataframe pads to the sheet's full grid size).
+
+    Raises a clear, actionable RuntimeError on a missing sheet or tab, in
+    the same style as write_sheet()'s WorksheetNotFound handling.
+    """
+    try:
+        sheet = gc.open_by_key(sheet_key)
+    except gspread.exceptions.SpreadsheetNotFound:
+        raise RuntimeError(
+            f"❌ Could not open sheet '{sheet_key}'. Share it with this "
+            f"service account as Editor: {service_info.get('client_email')}"
+        )
+
+    try:
+        ws = sheet.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        available = [w.title for w in sheet.worksheets()]
+        raise RuntimeError(
+            f"❌ Tab '{tab_name}' not found in '{sheet.title}'. "
+            f"Available tabs: {available}"
+        )
+
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str)
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    return df
+
+
+def run_sheet_sync():
+    """
+    Mirror SYNC_SOURCE_TAB_NAME (in SYNC_SOURCE_SHEET_ID) into
+    SYNC_DEST_TAB_NAME (in SYNC_DEST_SHEET_ID). Straight copy of values, no
+    filtering or transformation — the destination tab is cleared first so
+    it's an exact mirror of the source on every run.
+
+    Reuses write_sheet() for the write side, so this gets the same
+    clear/backoff/rate-limit-retry behavior as every other sheet write in
+    this pipeline (the standalone Colab version wrote directly and had no
+    such retry logic).
+    """
+    print("\n📌 Running: Sheet Sync (Student-Assign-WOW)")
+    df = read_sheet_as_df(SYNC_SOURCE_SHEET_ID, SYNC_SOURCE_TAB_NAME)
+    print(f"📊 shape={df.shape} | cols={list(df.columns)[:8]}")
+    write_sheet(SYNC_DEST_SHEET_ID, SYNC_DEST_TAB_NAME, df)
+
+
 # -------------------- MAIN --------------------
 def main():
     print("🚀 Starting Data Pipeline Automation...")
@@ -465,6 +536,7 @@ def main():
         ("Lecture Quality",             run_lecture_quality),
         ("Lecture Subjective Feedback", run_lecture_subjective_feedback),
         ("Assignment Questions Bucket", run_assignment_questions_bucket),
+        ("Sheet Sync (Student-Assign-WOW)", run_sheet_sync),
     ]
 
     success_count = 0
