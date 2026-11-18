@@ -221,22 +221,25 @@ def mb_post(url, attempt=0, stream=False):
 
 
 def validate_response(response, card_id):
-    """
-    Parse and validate a Metabase JSON response.
-    RAISES on empty results or error payloads — an empty result must never be
-    mistaken for 'nothing to do', because that silently leaves a sheet stale.
-    """
+    """Validate a Metabase JSON export without accepting empty or error results."""
     try:
+        if not response.content or not response.content.strip():
+            raise ValueError("empty response body")
         data = response.json()
-    except ValueError:
-        raise RuntimeError(
+    except ValueError as exc:
+        raise InvalidMetabaseJSON(
             f"Card {card_id}: invalid JSON (HTTP {response.status_code}, "
+            f"content-type={response.headers.get('Content-Type', 'unknown')!r}, "
+            f"bytes={len(response.content)}, "
             f"body starts: {response.text[:200]!r})"
-        )
+        ) from exc
 
     if isinstance(data, dict):
         err = data.get("error") or data.get("error_type") or data.get("message")
         raise RuntimeError(f"Card {card_id} query error: {err or data}")
+
+    if not isinstance(data, list):
+        raise RuntimeError(f"Card {card_id}: unexpected JSON result type: {type(data).__name__}")
 
     if not data:
         raise RuntimeError(
@@ -244,6 +247,11 @@ def validate_response(response, card_id):
             f"with an empty result."
         )
     return data
+
+
+class InvalidMetabaseJSON(RuntimeError):
+    """A successful HTTP response that cannot be decoded as a JSON export."""
+
 
 
 def dedupe_columns(df, card_id):
@@ -315,8 +323,23 @@ def fetch_card_df(card_id):
         except Exception as e:
             print(f"   ⚠️ CSV path failed for card {card_id} ({e}); trying JSON")
 
-    r = mb_post(card_url(card_id, "json"))
-    data = validate_response(r, card_id)
+    # A 200 response can still contain an empty body (observed on card 9192).
+    # Retry the entire query only for invalid JSON, not for legitimate query errors.
+    for attempt in range(MB_MAX_RETRIES + 1):
+        r = mb_post(card_url(card_id, "json"))
+        try:
+            data = validate_response(r, card_id)
+            break
+        except InvalidMetabaseJSON as exc:
+            if attempt >= MB_MAX_RETRIES:
+                raise RuntimeError(
+                    f"Card {card_id}: invalid JSON after {attempt + 1} requests"
+                ) from exc
+            wait = MB_RETRY_BASE_WAIT * (attempt + 1)
+            print(f"   🔁 {exc}; retry {attempt + 1}/{MB_MAX_RETRIES} in {wait}s", flush=True)
+            time.sleep(wait)
+        finally:
+            r.close()
     df = pd.DataFrame(data)
     df = dedupe_columns(df, card_id)
     print(f"   ✅ Card {card_id}: {len(df)} rows via JSON")
